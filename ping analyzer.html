@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>Ping-Frequenz-Analyzer</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 800px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+    h1 {
+      font-size: 1.6rem;
+      margin-bottom: 0.5rem;
+    }
+    .card {
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      padding: 1rem 1.2rem;
+      margin-bottom: 1rem;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    label {
+      font-weight: 600;
+    }
+    input[type="file"] {
+      margin-top: 0.3rem;
+    }
+    button {
+      margin-top: 0.8rem;
+      padding: 0.4rem 0.8rem;
+      border-radius: 4px;
+      border: 1px solid #888;
+      background: #f0f0f0;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    #status {
+      margin-top: 0.5rem;
+      font-size: 0.9rem;
+      color: #444;
+      white-space: pre-line;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 0.8rem;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 0.3rem 0.4rem;
+      text-align: right;
+      font-size: 0.9rem;
+    }
+    th {
+      background: #f7f7f7;
+    }
+    td:first-child, th:first-child {
+      text-align: center;
+    }
+    #log {
+      font-family: monospace;
+      font-size: 0.8rem;
+      color: #555;
+      margin-top: 0.5rem;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>Ping-Frequenz-Analyzer (Top 5 Peaks)</h1>
+
+  <div class="card">
+    <label for="fileInput">Audio-Datei wählen (wav, m4a, mp3, flac …):</label><br>
+    <input id="fileInput" type="file" accept=".wav,.wave,.m4a,.mp3,.flac,audio/*">
+    <br>
+    <button id="analyzeBtn" disabled>Analyse starten</button>
+    <div id="status">Noch keine Datei geladen.</div>
+    <div id="log"></div>
+  </div>
+
+  <div class="card">
+    <h2>Signifikanteste Frequenzen</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Frequenz [Hz]</th>
+          <th>Amplitude (rel.)</th>
+        </tr>
+      </thead>
+      <tbody id="resultsBody">
+        <tr><td colspan="3" style="text-align:center;">Noch keine Analyse durchgeführt.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const statusEl = document.getElementById('status');
+    const resultsBody = document.getElementById('resultsBody');
+    const logEl = document.getElementById('log');
+
+    let audioBufferGlobal = null;
+    let sampleRateGlobal = null;
+
+    fileInput.addEventListener('change', handleFileChange);
+    analyzeBtn.addEventListener('click', analyzeSpectrum);
+
+    function appendLog(msg) {
+      logEl.textContent += msg + "\n";
+    }
+
+    async function handleFileChange(e) {
+      const file = e.target.files[0];
+      if (!file) {
+        analyzeBtn.disabled = true;
+        statusEl.textContent = "Noch keine Datei geladen.";
+        return;
+      }
+      statusEl.textContent = "Lade und dekodiere Audio …";
+      logEl.textContent = "";
+
+      const reader = new FileReader();
+      reader.onload = async (ev) => {
+        const arrayBuffer = ev.target.result;
+        try {
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          const audioCtx = new AudioCtx();
+
+          // decodeAudioData als Promise kapseln, damit es in allen Browsern klappt
+          const audioBuffer = await new Promise((resolve, reject) => {
+            audioCtx.decodeAudioData(
+              arrayBuffer.slice(0),
+              decoded => resolve(decoded),
+              err => reject(err)
+            );
+          });
+
+          audioBufferGlobal = audioBuffer;
+          sampleRateGlobal = audioBuffer.sampleRate;
+          const dur = audioBuffer.duration.toFixed(2);
+          statusEl.textContent = `Geladen: ${file.name}\nLänge: ${dur} s, Abtastrate: ${sampleRateGlobal} Hz`;
+          appendLog(`Kanäle: ${audioBuffer.numberOfChannels}`);
+          analyzeBtn.disabled = false;
+          audioCtx.close();
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = "Fehler beim Dekodieren des Audios.";
+          analyzeBtn.disabled = true;
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    }
+
+    function analyzeSpectrum() {
+      if (!audioBufferGlobal) {
+        statusEl.textContent = "Bitte zuerst eine Datei laden.";
+        return;
+      }
+      try {
+        const channelData = audioBufferGlobal.getChannelData(0); // erster Kanal
+        const sr = sampleRateGlobal;
+        const totalLen = channelData.length;
+
+        // N = größte Zweierpotenz <= min(65536, totalLen)
+        const maxN = 65536;
+        const maxLen = Math.min(maxN, totalLen);
+        let N = 1;
+        while ((N << 1) <= maxLen) {
+          N <<= 1;
+        }
+
+        // Mittelpunkt des stärksten Impulses suchen (max. Absolutwert)
+        let maxIdx = 0;
+        let maxAbs = 0;
+        for (let i = 0; i < totalLen; i++) {
+          const v = Math.abs(channelData[i]);
+          if (v > maxAbs) {
+            maxAbs = v;
+            maxIdx = i;
+          }
+        }
+
+        let start = maxIdx - (N >> 1);
+        if (start < 0) start = 0;
+        if (start + N > totalLen) start = totalLen - N;
+        if (start < 0) start = 0;
+
+        appendLog(`Verwende Fensterlänge N=${N}, Startindex=${start}, Peakindex=${maxIdx}`);
+
+        // Segment extrahieren und Hann-Fenster anwenden
+        const real = new Float32Array(N);
+        const imag = new Float32Array(N);
+        const twoPi = 2 * Math.PI;
+        for (let i = 0; i < N; i++) {
+          const x = channelData[start + i];
+          const w = 0.5 * (1 - Math.cos(twoPi * i / (N - 1))); // Hann
+          real[i] = x * w;
+          imag[i] = 0;
+        }
+
+        // FFT berechnen
+        fft(real, imag);
+
+        // Betragsspektrum berechnen (nur 0..N/2 relevant)
+        const magnitudes = new Float32Array(N >> 1);
+        for (let k = 0; k < (N >> 1); k++) {
+          const re = real[k];
+          const im = imag[k];
+          magnitudes[k] = Math.hypot(re, im); // sqrt(re^2 + im^2)
+        }
+
+        // Top-5-Peaks suchen (ohne DC und sehr tiefe Frequenzen)
+        const minFreq = 500;   // unter 500 Hz ist meist nur Rauschen/Brumm
+        const maxFreq = sr / 2;
+        const minBin = Math.floor(minFreq * N / sr);
+        const maxBin = (N >> 1) - 1;
+
+        const peaks = [];
+        for (let k = minBin; k <= maxBin; k++) {
+          peaks.push({ bin: k, mag: magnitudes[k] });
+        }
+
+        // nach Amplitude sortieren (absteigend)
+        peaks.sort((a, b) => b.mag - a.mag);
+
+        const selected = [];
+        const takenFreqs = [];
+
+        const freqTolerance = 200; // Hz Mindestabstand zwischen Peaks
+
+        for (let i = 0; i < peaks.length && selected.length < 5; i++) {
+          const k = peaks[i].bin;
+          const f = k * sr / N;
+          const mag = peaks[i].mag;
+
+          // Frequenzen, die zu nah an bereits gewählten liegen, überspringen
+          let tooClose = false;
+          for (const f0 of takenFreqs) {
+            if (Math.abs(f - f0) < freqTolerance) {
+              tooClose = true;
+              break;
+            }
+          }
+          if (tooClose) continue;
+
+          selected.push({ freq: f, mag: mag });
+          takenFreqs.push(f);
+        }
+
+        // Ausgabe
+        if (selected.length === 0) {
+          resultsBody.innerHTML = '<tr><td colspan="3" style="text-align:center;">Keine signifikanten Peaks gefunden.</td></tr>';
+        } else {
+          // nach Frequenz sortieren (optional: nach Amplitude sortiert lassen)
+          // selected.sort((a,b) => a.freq - b.freq);
+          let rows = "";
+          const maxMag = selected[0].mag;
+          selected.forEach((p, idx) => {
+            const relAmp = p.mag / maxMag;
+            rows += `<tr>
+              <td>${idx + 1}</td>
+              <td>${p.freq.toFixed(1)}</td>
+              <td>${relAmp.toFixed(3)}</td>
+            </tr>`;
+          });
+          resultsBody.innerHTML = rows;
+        }
+
+        statusEl.textContent += `\nAnalyse fertig.`;
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "Fehler bei der Analyse.";
+      }
+    }
+
+    // Radix-2 Cooley–Tukey FFT (In-place, vorwärts)
+    function fft(real, imag) {
+      const n = real.length;
+      if (n !== imag.length) {
+        throw new Error("Real- und Imaginärteil müssen gleiche Länge haben.");
+      }
+      const levels = Math.log2(n);
+      if (Math.floor(levels) !== levels) {
+        throw new Error("Länge ist keine Zweierpotenz.");
+      }
+
+      // Bit-Reversal
+      for (let i = 0, j = 0; i < n; i++) {
+        if (j > i) {
+          let t = real[i]; real[i] = real[j]; real[j] = t;
+          t = imag[i]; imag[i] = imag[j]; imag[j] = t;
+        }
+        let m = n >> 1;
+        while (m >= 1 && (j & m)) {
+          j ^= m;
+          m >>= 1;
+        }
+        j |= m;
+      }
+
+      // Cooley–Tukey
+      for (let size = 2; size <= n; size <<= 1) {
+        const halfSize = size >> 1;
+        const phaseStep = -2 * Math.PI / size;
+        for (let i = 0; i < n; i += size) {
+          for (let j = 0; j < halfSize; j++) {
+            const k = i + j;
+            const l = k + halfSize;
+            const angle = phaseStep * j;
+            const cos = Math.cos(angle);
+            const sin = Math.sin(angle);
+            const tre =  real[l] * cos - imag[l] * sin;
+            const tim =  real[l] * sin + imag[l] * cos;
+            real[l] = real[k] - tre;
+            imag[l] = imag[k] - tim;
+            real[k] += tre;
+            imag[k] += tim;
+          }
+        }
+      }
+    }
+  </script>
+</body>
+</html>
