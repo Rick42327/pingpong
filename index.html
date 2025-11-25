@@ -6,7 +6,7 @@
   <style>
     body {
       font-family: system-ui, sans-serif;
-      max-width: 800px;
+      max-width: 900px;
       margin: 2rem auto;
       padding: 0 1rem;
     }
@@ -69,10 +69,29 @@
       margin-top: 0.5rem;
       white-space: pre-wrap;
     }
+    #spectrumCanvas {
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      margin-top: 0.5rem;
+      width: 100%;
+      max-width: 800px;
+      height: 300px;
+    }
+    #peakControls {
+      margin-top: 0.6rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    #peakInfo {
+      font-size: 0.9rem;
+      color: #333;
+    }
   </style>
 </head>
 <body>
-  <h1>Ping-Frequenz-Analyzer (Top 5 Peaks)</h1>
+  <h1>Ping-Frequenz-Analyzer (Top 10 Peaks)</h1>
 
   <div class="card">
     <label for="fileInput">Audio-Datei wählen (wav, m4a, mp3, flac …):</label><br>
@@ -84,7 +103,17 @@
   </div>
 
   <div class="card">
-    <h2>Signifikanteste Frequenzen</h2>
+    <h2>Spektrum (Amplitude in dB, ab 1000 Hz)</h2>
+    <canvas id="spectrumCanvas" width="800" height="300"></canvas>
+    <div id="peakControls">
+      <button id="prevPeakBtn" disabled>◀ Peak</button>
+      <button id="nextPeakBtn" disabled>Peak ▶</button>
+      <div id="peakInfo">Noch keine Peaks.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Signifikanteste Frequenzen (Top 10)</h2>
     <table>
       <thead>
         <tr>
@@ -106,11 +135,29 @@
     const resultsBody = document.getElementById('resultsBody');
     const logEl = document.getElementById('log');
 
+    const spectrumCanvas = document.getElementById('spectrumCanvas');
+    const ctx = spectrumCanvas.getContext('2d');
+    const prevPeakBtn = document.getElementById('prevPeakBtn');
+    const nextPeakBtn = document.getElementById('nextPeakBtn');
+    const peakInfoEl = document.getElementById('peakInfo');
+
     let audioBufferGlobal = null;
     let sampleRateGlobal = null;
 
+    let spectrumData = null;      // {magnitudes, minBin, maxBin, N, sr, maxMag, minFreq, maxFreq}
+    let peaksList = [];           // [{freq, mag, relAmp}]
+    let currentPeakIndex = -1;
+
+    const MIN_FREQ_HZ = 1000;   // Analyse erst ab 1000 Hz
+    const NUM_PEAKS = 10;       // Anzahl signifikantester Peaks
+    const MIN_DB = -80;         // unter -80 dB wird abgeschnitten
+    const GATE_OFFSET_MS = 10;  // Fenster beginnt 10 ms nach dem Schlag
+
     fileInput.addEventListener('change', handleFileChange);
     analyzeBtn.addEventListener('click', analyzeSpectrum);
+    prevPeakBtn.addEventListener('click', () => selectPeak(currentPeakIndex - 1));
+    nextPeakBtn.addEventListener('click', () => selectPeak(currentPeakIndex + 1));
+    spectrumCanvas.addEventListener('click', handleCanvasClick);
 
     function appendLog(msg) {
       logEl.textContent += msg + "\n";
@@ -125,6 +172,7 @@
       }
       statusEl.textContent = "Lade und dekodiere Audio …";
       logEl.textContent = "";
+      resetAnalysis();
 
       const reader = new FileReader();
       reader.onload = async (ev) => {
@@ -133,7 +181,6 @@
           const AudioCtx = window.AudioContext || window.webkitAudioContext;
           const audioCtx = new AudioCtx();
 
-          // decodeAudioData als Promise kapseln, damit es in allen Browsern klappt
           const audioBuffer = await new Promise((resolve, reject) => {
             audioCtx.decodeAudioData(
               arrayBuffer.slice(0),
@@ -158,17 +205,27 @@
       reader.readAsArrayBuffer(file);
     }
 
+    function resetAnalysis() {
+      spectrumData = null;
+      peaksList = [];
+      currentPeakIndex = -1;
+      drawEmptySpectrum();
+      resultsBody.innerHTML = '<tr><td colspan="3" style="text-align:center;">Noch keine Analyse durchgeführt.</td></tr>';
+      peakInfoEl.textContent = "Noch keine Peaks.";
+      prevPeakBtn.disabled = true;
+      nextPeakBtn.disabled = true;
+    }
+
     function analyzeSpectrum() {
       if (!audioBufferGlobal) {
         statusEl.textContent = "Bitte zuerst eine Datei laden.";
         return;
       }
       try {
-        const channelData = audioBufferGlobal.getChannelData(0); // erster Kanal
+        const channelData = audioBufferGlobal.getChannelData(0);
         const sr = sampleRateGlobal;
         const totalLen = channelData.length;
 
-        // N = größte Zweierpotenz <= min(65536, totalLen)
         const maxN = 65536;
         const maxLen = Math.min(maxN, totalLen);
         let N = 1;
@@ -176,7 +233,7 @@
           N <<= 1;
         }
 
-        // Mittelpunkt des stärksten Impulses suchen (max. Absolutwert)
+        // stärksten Impuls (Schlag) finden
         let maxIdx = 0;
         let maxAbs = 0;
         for (let i = 0; i < totalLen; i++) {
@@ -187,60 +244,74 @@
           }
         }
 
-        let start = maxIdx - (N >> 1);
-        if (start < 0) start = 0;
+        // Fenster NICHT um den Schlag zentrieren,
+        // sondern NACH dem Schlag starten (Gate)
+        const gateOffsetSamples = Math.floor(sr * (GATE_OFFSET_MS / 1000));
+        let start = maxIdx + gateOffsetSamples;
         if (start + N > totalLen) start = totalLen - N;
         if (start < 0) start = 0;
 
-        appendLog(`Verwende Fensterlänge N=${N}, Startindex=${start}, Peakindex=${maxIdx}`);
+        appendLog(`Verwende Fensterlänge N=${N}, Startindex=${start}, Peakindex=${maxIdx}, Offset=${gateOffsetSamples} Samples`);
 
-        // Segment extrahieren und Hann-Fenster anwenden
         const real = new Float32Array(N);
         const imag = new Float32Array(N);
         const twoPi = 2 * Math.PI;
         for (let i = 0; i < N; i++) {
           const x = channelData[start + i];
-          const w = 0.5 * (1 - Math.cos(twoPi * i / (N - 1))); // Hann
+          const w = 0.5 * (1 - Math.cos(twoPi * i / (N - 1))); // Hann-Fenster
           real[i] = x * w;
           imag[i] = 0;
         }
 
-        // FFT berechnen
         fft(real, imag);
 
-        // Betragsspektrum berechnen (nur 0..N/2 relevant)
-        const magnitudes = new Float32Array(N >> 1);
-        for (let k = 0; k < (N >> 1); k++) {
+        const halfN = N >> 1;
+        const magnitudes = new Float32Array(halfN);
+        for (let k = 0; k < halfN; k++) {
           const re = real[k];
           const im = imag[k];
-          magnitudes[k] = Math.hypot(re, im); // sqrt(re^2 + im^2)
+          magnitudes[k] = Math.hypot(re, im);
         }
 
-        // Top-5-Peaks suchen (ohne DC und sehr tiefe Frequenzen)
-        const minFreq = 500;   // unter 500 Hz ist meist nur Rauschen/Brumm
-        const maxFreq = sr / 2;
-        const minBin = Math.floor(minFreq * N / sr);
-        const maxBin = (N >> 1) - 1;
+        const minBin = Math.floor(MIN_FREQ_HZ * N / sr);
+        const maxBin = halfN - 1;
+        const minFreq = MIN_FREQ_HZ;
+        const maxFreq = (maxBin * sr) / N;
 
+        // Maximalwert nur im angezeigten Bereich
+        let displayMaxMag = 0;
+        for (let k = minBin; k <= maxBin; k++) {
+          if (magnitudes[k] > displayMaxMag) displayMaxMag = magnitudes[k];
+        }
+
+        spectrumData = {
+          magnitudes,
+          minBin,
+          maxBin,
+          N,
+          sr,
+          maxMag: displayMaxMag,
+          minFreq,
+          maxFreq
+        };
+
+        // Peaks suchen (Top NUM_PEAKS, mit Mindestabstand)
         const peaks = [];
         for (let k = minBin; k <= maxBin; k++) {
           peaks.push({ bin: k, mag: magnitudes[k] });
         }
-
-        // nach Amplitude sortieren (absteigend)
         peaks.sort((a, b) => b.mag - a.mag);
 
-        const selected = [];
+        const rawSelected = [];
         const takenFreqs = [];
+        const freqTolerance = 200; // Hz Mindestabstand
 
-        const freqTolerance = 200; // Hz Mindestabstand zwischen Peaks
-
-        for (let i = 0; i < peaks.length && selected.length < 5; i++) {
+        for (let i = 0; i < peaks.length && rawSelected.length < NUM_PEAKS; i++) {
           const k = peaks[i].bin;
           const f = k * sr / N;
           const mag = peaks[i].mag;
+          if (mag <= 0) continue;
 
-          // Frequenzen, die zu nah an bereits gewählten liegen, überspringen
           let tooClose = false;
           for (const f0 of takenFreqs) {
             if (Math.abs(f - f0) < freqTolerance) {
@@ -250,29 +321,42 @@
           }
           if (tooClose) continue;
 
-          selected.push({ freq: f, mag: mag });
+          rawSelected.push({ freq: f, mag: mag });
           takenFreqs.push(f);
         }
 
-        // Ausgabe
-        if (selected.length === 0) {
+        if (rawSelected.length === 0) {
+          peaksList = [];
           resultsBody.innerHTML = '<tr><td colspan="3" style="text-align:center;">Keine signifikanten Peaks gefunden.</td></tr>';
+          peakInfoEl.textContent = "Keine Peaks gefunden.";
+          prevPeakBtn.disabled = true;
+          nextPeakBtn.disabled = true;
         } else {
-          // nach Frequenz sortieren (optional: nach Amplitude sortiert lassen)
-          // selected.sort((a,b) => a.freq - b.freq);
+          rawSelected.sort((a, b) => a.freq - b.freq);
+          const maxMagSel = rawSelected.reduce((m, p) => p.mag > m ? p.mag : m, 0);
+          peaksList = rawSelected.map(p => ({
+            freq: p.freq,
+            mag: p.mag,
+            relAmp: p.mag / maxMagSel
+          }));
+
           let rows = "";
-          const maxMag = selected[0].mag;
-          selected.forEach((p, idx) => {
-            const relAmp = p.mag / maxMag;
+          peaksList.forEach((p, idx) => {
             rows += `<tr>
               <td>${idx + 1}</td>
               <td>${p.freq.toFixed(1)}</td>
-              <td>${relAmp.toFixed(3)}</td>
+              <td>${p.relAmp.toFixed(3)}</td>
             </tr>`;
           });
           resultsBody.innerHTML = rows;
+
+          currentPeakIndex = 0;
+          prevPeakBtn.disabled = peaksList.length <= 1;
+          nextPeakBtn.disabled = peaksList.length <= 1;
+          updatePeakInfo();
         }
 
+        drawSpectrum();
         statusEl.textContent += `\nAnalyse fertig.`;
       } catch (err) {
         console.error(err);
@@ -280,7 +364,172 @@
       }
     }
 
-    // Radix-2 Cooley–Tukey FFT (In-place, vorwärts)
+    function drawEmptySpectrum() {
+      const w = spectrumCanvas.width;
+      const h = spectrumCanvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#fafafa";
+      ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = "#999";
+      ctx.font = "12px system-ui";
+      ctx.fillText("Noch kein Spektrum vorhanden.", 10, 20);
+    }
+
+    function drawSpectrum() {
+      const w = spectrumCanvas.width;
+      const h = spectrumCanvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      if (!spectrumData) {
+        drawEmptySpectrum();
+        return;
+      }
+
+      const { magnitudes, minBin, maxBin, N, sr, maxMag, minFreq, maxFreq } = spectrumData;
+
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+
+      const padX = 40;
+      const padY = 20;
+      const plotW = w - 2 * padX;
+      const plotH = h - 2 * padY;
+
+      // Achsen
+      ctx.strokeStyle = "#ccc";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padX, h - padY);
+      ctx.lineTo(padX + plotW, h - padY);
+      ctx.moveTo(padX, h - padY);
+      ctx.lineTo(padX, padY);
+      ctx.stroke();
+
+      if (maxMag > 0) {
+        const binRange = maxBin - minBin + 1;
+        const binsPerPixel = binRange / plotW;
+
+        ctx.strokeStyle = "#0077cc";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+
+        // geglättete Kurve: pro Pixel max. Magnitude über die zugehörigen Bins
+        for (let i = 0; i < plotW; i++) {
+          const binStart = minBin + Math.floor(i * binsPerPixel);
+          const binEnd = Math.min(maxBin, minBin + Math.floor((i + 1) * binsPerPixel) - 1);
+          let mag = 0;
+          for (let k = binStart; k <= binEnd; k++) {
+            if (magnitudes[k] > mag) mag = magnitudes[k];
+          }
+          if (mag <= 0) mag = 1e-6;
+
+          let norm = mag / maxMag;
+          if (norm < 1e-6) norm = 1e-6;
+          let db = 20 * Math.log10(norm); // 0 dB = max im Bereich
+          if (db < MIN_DB) db = MIN_DB;
+          const yNorm = (db - MIN_DB) / (0 - MIN_DB); // [0..1]
+          const x = padX + i;
+          const y = (h - padY) - yNorm * plotH;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        // Peaks als Punkte
+        if (peaksList.length > 0) {
+          ctx.fillStyle = "#d9534f";
+          peaksList.forEach(p => {
+            const f = p.freq;
+            const fracX = (f - minFreq) / (maxFreq - minFreq);
+            const x = padX + fracX * plotW;
+            let norm = p.mag / maxMag;
+            if (norm < 1e-6) norm = 1e-6;
+            let db = 20 * Math.log10(norm);
+            if (db < MIN_DB) db = MIN_DB;
+            const yNorm = (db - MIN_DB) / (0 - MIN_DB);
+            const y = (h - padY) - yNorm * plotH;
+            ctx.beginPath();
+            ctx.arc(x, y, 3, 0, 2 * Math.PI);
+            ctx.fill();
+          });
+        }
+
+        // Cursor-Linie für aktuellen Peak
+        if (currentPeakIndex >= 0 && peaksList[currentPeakIndex]) {
+          const p = peaksList[currentPeakIndex];
+          const f = p.freq;
+          const fracX = (f - minFreq) / (maxFreq - minFreq);
+          const x = padX + fracX * plotW;
+          ctx.strokeStyle = "#ff9900";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(x, padY);
+          ctx.lineTo(x, h - padY);
+          ctx.stroke();
+        }
+      }
+
+      // einfache x-Achsen-Beschriftung (min / max)
+      ctx.fillStyle = "#555";
+      ctx.font = "11px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText(`${minFreq.toFixed(0)} Hz`, padX, h - 4);
+      ctx.fillText(`${maxFreq.toFixed(0)} Hz`, padX + plotW, h - 4);
+      ctx.textAlign = "left";
+    }
+
+    function selectPeak(idx) {
+      if (!peaksList.length) return;
+      if (idx < 0) idx = 0;
+      if (idx >= peaksList.length) idx = peaksList.length - 1;
+      currentPeakIndex = idx;
+      updatePeakInfo();
+      drawSpectrum();
+      prevPeakBtn.disabled = peaksList.length <= 1;
+      nextPeakBtn.disabled = peaksList.length <= 1;
+    }
+
+    function updatePeakInfo() {
+      if (!peaksList.length || currentPeakIndex < 0) {
+        peakInfoEl.textContent = "Keine Peaks.";
+        return;
+      }
+      const p = peaksList[currentPeakIndex];
+      peakInfoEl.textContent =
+        `Peak ${currentPeakIndex + 1} von ${peaksList.length}: ` +
+        `f = ${p.freq.toFixed(1)} Hz, rel. Amplitude = ${p.relAmp.toFixed(3)}`;
+    }
+
+    function handleCanvasClick(ev) {
+      if (!spectrumData || !peaksList.length) return;
+
+      const rect = spectrumCanvas.getBoundingClientRect();
+      const xClick = ev.clientX - rect.left;
+
+      const { minFreq, maxFreq } = spectrumData;
+      const padX = 40;
+      const plotW = spectrumCanvas.width - 2 * padX;
+
+      let frac = (xClick - padX) / plotW;
+      if (frac < 0) frac = 0;
+      if (frac > 1) frac = 1;
+      const freqClick = minFreq + frac * (maxFreq - minFreq);
+
+      // Nächstgelegenen Peak zur Klickfrequenz finden
+      let bestIdx = 0;
+      let bestDist = Infinity;
+      peaksList.forEach((p, idx) => {
+        const d = Math.abs(p.freq - freqClick);
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = idx;
+        }
+      });
+
+      selectPeak(bestIdx);
+    }
+
+    // Radix-2-FFT
     function fft(real, imag) {
       const n = real.length;
       if (n !== imag.length) {
@@ -291,7 +540,6 @@
         throw new Error("Länge ist keine Zweierpotenz.");
       }
 
-      // Bit-Reversal
       for (let i = 0, j = 0; i < n; i++) {
         if (j > i) {
           let t = real[i]; real[i] = real[j]; real[j] = t;
@@ -305,7 +553,6 @@
         j |= m;
       }
 
-      // Cooley–Tukey
       for (let size = 2; size <= n; size <<= 1) {
         const halfSize = size >> 1;
         const phaseStep = -2 * Math.PI / size;
@@ -316,8 +563,8 @@
             const angle = phaseStep * j;
             const cos = Math.cos(angle);
             const sin = Math.sin(angle);
-            const tre =  real[l] * cos - imag[l] * sin;
-            const tim =  real[l] * sin + imag[l] * cos;
+            const tre = real[l] * cos - imag[l] * sin;
+            const tim = real[l] * sin + imag[l] * cos;
             real[l] = real[k] - tre;
             imag[l] = imag[k] - tim;
             real[k] += tre;
@@ -326,6 +573,8 @@
         }
       }
     }
+
+    drawEmptySpectrum();
   </script>
 </body>
 </html>
