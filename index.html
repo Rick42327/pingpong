@@ -382,10 +382,8 @@
       const { N, minFreq, maxFreq, windowStartSample } = spectrumData;
 
       const fileName = loadedFileName || "ping";
-      let baseName = fileName.replace(/\.[^/.]+$/, "");
-      const now = new Date();
-      const ts = now.toISOString().replace(/[:.]/g, "-");
-      baseName = baseName + "_" + ts;
+	  const baseName = fileName.replace(/\.[^/.]+$/, "");
+
 
       const reportLines = [];
       reportLines.push("Ping-Analyzer Report");
