@@ -98,7 +98,7 @@
     <input id="fileInput" type="file" accept=".wav,.wave,.m4a,.mp3,.flac,audio/*">
     <br>
     <button id="analyzeBtn" disabled>Analyse starten</button>
-    <button id="exportBtn" disabled>Export (JSON + TXT)</button>
+    <button id="exportBtn" disabled>Export TXT</button>
     <div id="status">Noch keine Datei geladen.</div>
     <div id="log"></div>
   </div>
@@ -146,7 +146,8 @@
     let audioBufferGlobal = null;
     let sampleRateGlobal = null;
 
-    let spectrumData = null;      // {magnitudes, minBin, maxBin, N, sr, maxMag, minFreq, maxFreq, windowStartSample}
+    // {magnitudes, minBin, maxBin, N, sr, maxMag, minFreq, maxFreq, windowStartSample}
+    let spectrumData = null;
     let peaksList = [];           // [{freq, mag, relAmp}]
     let currentPeakIndex = -1;
     let loadedFileName = null;
@@ -378,78 +379,13 @@
         return;
       }
 
-      const { magnitudes, minBin, maxBin, N, sr, maxMag, minFreq, maxFreq } = spectrumData;
-      const numPoints = 2048;
-      const freqArr = [];
-      const ampArr = [];
-
-      if (maxMag > 0) {
-        for (let i = 0; i < numPoints; i++) {
-          const frac = i / (numPoints - 1);
-          const f = minFreq + frac * (maxFreq - minFreq);
-          let bin = Math.round(f * N / sr);
-          if (bin < minBin) bin = minBin;
-          if (bin > maxBin) bin = maxBin;
-          let mag = magnitudes[bin];
-          if (!isFinite(mag) || mag <= 0) mag = 1e-12;
-          let norm = mag / maxMag;
-          if (norm < 1e-12) norm = 1e-12;
-          let db = 20 * Math.log10(norm);
-          if (db < MIN_DB) db = MIN_DB;
-          freqArr.push(f);
-          ampArr.push(db);
-        }
-      }
-
-      const peaksExport = peaksList.map((p, idx) => {
-        const rel = p.relAmp;
-        let db = rel > 0 ? 20 * Math.log10(rel) : MIN_DB;
-        if (db < MIN_DB) db = MIN_DB;
-        return {
-          rank: idx + 1,
-          freq_hz: p.freq,
-          rel_amp: rel,
-          amp_db: db
-        };
-      });
+      const { N, minFreq, maxFreq, windowStartSample } = spectrumData;
 
       const fileName = loadedFileName || "ping";
       let baseName = fileName.replace(/\.[^/.]+$/, "");
       const now = new Date();
       const ts = now.toISOString().replace(/[:.]/g, "-");
       baseName = baseName + "_" + ts;
-
-      const exportObj = {
-        format: "ping-analyzer-export",
-        version: 1,
-        meta: {
-          file_name: loadedFileName || null,
-          sample_rate_hz: sampleRateGlobal,
-          duration_s: audioBufferGlobal.duration,
-          channel_used: 0,
-          num_channels: audioBufferGlobal.numberOfChannels
-        },
-        analysis_params: {
-          fft_size: N,
-          window_type: "hann",
-          window_start_sample: spectrumData.windowStartSample != null ? spectrumData.windowStartSample : null,
-          gate_offset_ms: GATE_OFFSET_MS,
-          min_freq_hz: minFreq,
-          max_freq_hz: maxFreq,
-          db_floor: MIN_DB
-        },
-        peaks: peaksExport,
-        spectrum_decimated: {
-          num_points: numPoints,
-          min_freq_hz: minFreq,
-          max_freq_hz: maxFreq,
-          freq_hz: freqArr,
-          amp_db: ampArr
-        }
-      };
-
-      const jsonStr = JSON.stringify(exportObj, null, 2);
-      downloadText(jsonStr, baseName + ".ping.json", "application/json");
 
       const reportLines = [];
       reportLines.push("Ping-Analyzer Report");
@@ -463,7 +399,7 @@
       reportLines.push("-----------------");
       reportLines.push(`FFT-Länge: ${N}`);
       reportLines.push("Fenster: Hann");
-      reportLines.push(`Fensterstart (Sample): ${spectrumData.windowStartSample != null ? spectrumData.windowStartSample : "n/a"}`);
+      reportLines.push(`Fensterstart (Sample): ${windowStartSample != null ? windowStartSample : "n/a"}`);
       reportLines.push(`Gate-Offset: ${GATE_OFFSET_MS} ms`);
       reportLines.push(`Frequenzbereich: ${minFreq.toFixed(1)} - ${maxFreq.toFixed(1)} Hz`);
       reportLines.push(`dB-Floor: ${MIN_DB} dB`);
