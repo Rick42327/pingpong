@@ -88,6 +88,13 @@
       font-size: 0.9rem;
       color: #333;
     }
+    #logScaleContainer {
+      margin-top: 0.4rem;
+      font-size: 0.9rem;
+    }
+    #logScaleContainer input {
+      margin-right: 0.3rem;
+    }
   </style>
 </head>
 <body>
@@ -104,7 +111,13 @@
   </div>
 
   <div class="card">
-    <h2>Spektrum (Amplitude in dB, ab 400 Hz)</h2>
+    <h2>Spektrum (Amplitude in dB, ab 50 Hz)</h2>
+    <div id="logScaleContainer">
+      <label>
+        <input type="checkbox" id="logScaleToggle">
+        Logarithmische Frequenzachse
+      </label>
+    </div>
     <canvas id="spectrumCanvas" width="800" height="300"></canvas>
     <div id="peakControls">
       <button id="prevPeakBtn" disabled>◀ Peak</button>
@@ -142,6 +155,7 @@
     const nextPeakBtn = document.getElementById('nextPeakBtn');
     const peakInfoEl = document.getElementById('peakInfo');
     const exportBtn = document.getElementById('exportBtn');
+    const logScaleToggle = document.getElementById('logScaleToggle');
 
     let audioBufferGlobal = null;
     let sampleRateGlobal = null;
@@ -152,10 +166,12 @@
     let currentPeakIndex = -1;
     let loadedFileName = null;
 
-    const MIN_FREQ_HZ = 400;    // Analyse ab 400 Hz
+    const MIN_FREQ_HZ = 50;    // Analyse ab 50 Hz
     const NUM_PEAKS = 10;       // Anzahl signifikantester Peaks
     const MIN_DB = -80;         // unter -80 dB wird abgeschnitten
     const GATE_OFFSET_MS = 10;  // Fenster beginnt 10 ms nach dem Schlag
+
+    let useLogScale = false;
 
     fileInput.addEventListener('change', handleFileChange);
     analyzeBtn.addEventListener('click', analyzeSpectrum);
@@ -163,6 +179,10 @@
     prevPeakBtn.addEventListener('click', () => selectPeak(currentPeakIndex - 1));
     nextPeakBtn.addEventListener('click', () => selectPeak(currentPeakIndex + 1));
     spectrumCanvas.addEventListener('click', handleCanvasClick);
+    logScaleToggle.addEventListener('change', () => {
+      useLogScale = logScaleToggle.checked;
+      drawSpectrum();
+    });
 
     function appendLog(msg) {
       logEl.textContent += msg + "\n";
@@ -382,8 +402,7 @@
       const { N, minFreq, maxFreq, windowStartSample } = spectrumData;
 
       const fileName = loadedFileName || "ping";
-	  const baseName = fileName.replace(/\.[^/.]+$/, "");
-
+      const baseName = fileName.replace(/\.[^/.]+$/, "");
 
       const reportLines = [];
       reportLines.push("Ping-Analyzer Report");
@@ -401,6 +420,7 @@
       reportLines.push(`Gate-Offset: ${GATE_OFFSET_MS} ms`);
       reportLines.push(`Frequenzbereich: ${minFreq.toFixed(1)} - ${maxFreq.toFixed(1)} Hz`);
       reportLines.push(`dB-Floor: ${MIN_DB} dB`);
+      reportLines.push(`x-Achse: ${useLogScale ? "logarithmisch" : "linear"}`);
       reportLines.push("");
       reportLines.push("Top-Peaks");
       reportLines.push("---------");
@@ -444,6 +464,51 @@
       ctx.fillText("Noch kein Spektrum vorhanden.", 10, 20);
     }
 
+    // Helper: Frequenz ↔︎ [0..1] (je nach Skala)
+    function freqToFrac(freq, minFreq, maxFreq) {
+      if (freq < minFreq) freq = minFreq;
+      if (freq > maxFreq) freq = maxFreq;
+      if (!useLogScale) {
+        return (freq - minFreq) / (maxFreq - minFreq);
+      } else {
+        const safeMin = Math.max(minFreq, 1e-3);
+        const logMin = Math.log10(safeMin);
+        const logMax = Math.log10(maxFreq);
+        const logF  = Math.log10(Math.max(freq, safeMin));
+        return (logF - logMin) / (logMax - logMin);
+      }
+    }
+
+    function fracToFreq(frac, minFreq, maxFreq) {
+      if (frac < 0) frac = 0;
+      if (frac > 1) frac = 1;
+      if (!useLogScale) {
+        return minFreq + frac * (maxFreq - minFreq);
+      } else {
+        const safeMin = Math.max(minFreq, 1e-3);
+        const logMin = Math.log10(safeMin);
+        const logMax = Math.log10(maxFreq);
+        const logF = logMin + frac * (logMax - logMin);
+        return Math.pow(10, logF);
+      }
+    }
+
+    // Tick-Frequenzen für die x-Achse (log-freundliche Werte)
+    function getTickFrequencies(minFreq, maxFreq) {
+      const baseTicks = [
+        50, 100, 200, 500,
+        1000, 2000, 5000,
+        10000, 20000
+      ];
+      return baseTicks.filter(f => f > minFreq * 1.001 && f < maxFreq * 0.999);
+    }
+
+    function formatHzLabel(f) {
+      if (f < 1000) return `${Math.round(f)} Hz`;
+      if (f < 10000) return `${(f / 1000).toFixed(1)} kHz`;
+      return `${(f / 1000).toFixed(0)} kHz`;
+    }
+
     function drawSpectrum() {
       const w = spectrumCanvas.width;
       const h = spectrumCanvas.height;
@@ -474,42 +539,72 @@
       ctx.lineTo(padX, padY);
       ctx.stroke();
 
-      if (maxMag > 0) {
-        const binRange = maxBin - minBin + 1;
-        const binsPerPixel = binRange / plotW;
+      const tickFreqs = getTickFrequencies(minFreq, maxFreq);
 
+      // vertikale Gitterlinien an Tick-Frequenzen
+      ctx.strokeStyle = "#eee";
+      ctx.lineWidth = 1;
+      tickFreqs.forEach(f => {
+        const fracX = freqToFrac(f, minFreq, maxFreq);
+        const x = padX + fracX * plotW;
+        ctx.beginPath();
+        ctx.moveTo(x, padY);
+        ctx.lineTo(x, h - padY);
+        ctx.stroke();
+      });
+
+      if (maxMag > 0 && plotW > 0) {
         ctx.strokeStyle = "#0077cc";
         ctx.lineWidth = 1;
         ctx.beginPath();
 
-        // geglättete Kurve: pro Pixel max. Magnitude über die zugehörigen Bins
-        for (let i = 0; i < plotW; i++) {
-          const binStart = minBin + Math.floor(i * binsPerPixel);
-          const binEnd = Math.min(maxBin, minBin + Math.floor((i + 1) * binsPerPixel) - 1);
+        const steps = plotW;
+
+        for (let i = 0; i < steps; i++) {
+          // Frequenzbereich, der auf diesen Pixel abgebildet wird
+          const fracStart = i / steps;
+          const fracEnd   = (i + 1) / steps;
+          let fStart = fracToFreq(fracStart, minFreq, maxFreq);
+          let fEnd   = fracToFreq(fracEnd,   minFreq, maxFreq);
+          if (fEnd < fStart) { const tmp = fStart; fStart = fEnd; fEnd = tmp; }
+
+          // in Bin-Indizes umrechnen
+          let binStart = Math.floor(fStart * N / sr);
+          let binEnd   = Math.floor(fEnd   * N / sr);
+
+          if (binStart < minBin) binStart = minBin;
+          if (binEnd   > maxBin) binEnd   = maxBin;
+          if (binEnd < binStart) binEnd = binStart; // mindestens ein Bin
+
+          // Maximum in diesem Frequenzintervall
           let mag = 0;
           for (let k = binStart; k <= binEnd; k++) {
-            if (magnitudes[k] > mag) mag = magnitudes[k];
+            const m = magnitudes[k];
+            if (m > mag) mag = m;
           }
           if (mag <= 0) mag = 1e-6;
 
           let norm = mag / maxMag;
           if (norm < 1e-6) norm = 1e-6;
-          let db = 20 * Math.log10(norm); // 0 dB = max im Bereich
+          let db = 20 * Math.log10(norm);
           if (db < MIN_DB) db = MIN_DB;
-          const yNorm = (db - MIN_DB) / (0 - MIN_DB); // [0..1]
-          const x = padX + i;
+          const yNorm = (db - MIN_DB) / (0 - MIN_DB);
+
+          const fracMid = (i + 0.5) / steps;    // Mitte des Pixels
+          const x = padX + fracMid * plotW;
           const y = (h - padY) - yNorm * plotH;
+
           if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
+          else         ctx.lineTo(x, y);
         }
+
         ctx.stroke();
 
         // Peaks als Punkte
         if (peaksList.length > 0) {
           ctx.fillStyle = "#d9534f";
           peaksList.forEach(p => {
-            const f = p.freq;
-            const fracX = (f - minFreq) / (maxFreq - minFreq);
+            const fracX = freqToFrac(p.freq, minFreq, maxFreq);
             const x = padX + fracX * plotW;
             let norm = p.mag / maxMag;
             if (norm < 1e-6) norm = 1e-6;
@@ -526,8 +621,7 @@
         // Cursor-Linie für aktuellen Peak
         if (currentPeakIndex >= 0 && peaksList[currentPeakIndex]) {
           const p = peaksList[currentPeakIndex];
-          const f = p.freq;
-          const fracX = (f - minFreq) / (maxFreq - minFreq);
+          const fracX = freqToFrac(p.freq, minFreq, maxFreq);
           const x = padX + fracX * plotW;
           ctx.strokeStyle = "#ff9900";
           ctx.lineWidth = 1;
@@ -538,11 +632,27 @@
         }
       }
 
-      // einfache x-Achsen-Beschriftung (min / max)
+      // x-Achsen-Beschriftung: Ticks
       ctx.fillStyle = "#555";
-      ctx.font = "11px system-ui";
+      ctx.font = "10px system-ui";
       ctx.textAlign = "center";
+      let lastLabelX = -Infinity;
+      tickFreqs.forEach(f => {
+        const fracX = freqToFrac(f, minFreq, maxFreq);
+        const x = padX + fracX * plotW;
+        // Labels nicht zu dicht nebeneinander & nicht direkt an den Rand
+        if (x - lastLabelX < 35) return;
+        if (x < padX + 15) return;
+        if (x > padX + plotW - 15) return;
+        ctx.fillText(formatHzLabel(f), x, h - 4);
+        lastLabelX = x;
+      });
+
+      // Min/Max-Beschriftung
+      ctx.font = "11px system-ui";
+      ctx.textAlign = "left";
       ctx.fillText(`${minFreq.toFixed(0)} Hz`, padX, h - 4);
+      ctx.textAlign = "right";
       ctx.fillText(`${maxFreq.toFixed(0)} Hz`, padX + plotW, h - 4);
       ctx.textAlign = "left";
     }
@@ -580,9 +690,7 @@
       const plotW = spectrumCanvas.width - 2 * padX;
 
       let frac = (xClick - padX) / plotW;
-      if (frac < 0) frac = 0;
-      if (frac > 1) frac = 1;
-      const freqClick = minFreq + frac * (maxFreq - minFreq);
+      const freqClick = fracToFreq(frac, minFreq, maxFreq);
 
       // Nächstgelegenen Peak zur Klickfrequenz finden
       let bestIdx = 0;
